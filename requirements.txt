@@ -1,0 +1,7 @@
+fastapi>=0.111.0
+pydantic>=2.7.1
+uvicorn>=0.30.1
+openenv-core
+pandas
+google-genai
+python-dotenv
