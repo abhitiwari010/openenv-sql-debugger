@@ -1,7 +1,7 @@
 import os
 import textwrap
 from openai import OpenAI
-from typing import List
+from typing import List, Dict, Any
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -15,10 +15,10 @@ ENV_IMAGE_NAME = "sql-agent-env:latest"
 
 # LLM inference config as per instructions
 API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
-MAX_STEPS = 10
+MAX_STEPS = int(os.getenv("MAX_STEPS", "20"))
+OPENAI_SEED = int(os.getenv("OPENAI_SEED", "42"))
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
@@ -64,22 +64,10 @@ def parse_model_action(response_text: str) -> str:
     return query.strip()
 
 def main():
-    if not API_KEY and not GEMINI_API_KEY:
-        print("WARNING: API credentials might be missing. Using dummy environment flow for validation.")
-    
-    # Client setup
-    client_type = "openai"
-    if GEMINI_API_KEY:
-        try:
-            from google import genai
-            client = genai.Client(api_key=GEMINI_API_KEY)
-            client_type = "gemini"
-            print("--- Using Google Gemini Client ---")
-        except ImportError:
-            print("WARNING: google-genai package not found. Falling back to OpenAI client.")
-            client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY or "dummy-key")
-    else:
-        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY or "dummy-key")
+    if not API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is required for reproducible baseline runs.")
+
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
     print("--- SQL Data Analyst OpenEnv Baseline ---")
     
@@ -105,7 +93,9 @@ def main():
                 pass
         env = DirectClient(base_env)
 
-    history = []
+    history: List[str] = []
+    task_scores: Dict[str, float] = {}
+    run_trace: List[Dict[str, Any]] = []
     
     try:
         result = env.reset()
@@ -124,52 +114,59 @@ def main():
                 {"role": "user", "content": user_prompt},
             ]
             
-            try:
-                if client_type == "gemini":
-                    # For Gemini, we collapse System & User prompts into a single payload
-                    gemini_prompt = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
-                    # Use provided model Name, fallback defaults to gemini-2.5-flash
-                    gemini_model = MODEL_NAME if MODEL_NAME != "gpt-4o-mini" else "gemini-2.5-flash"
-                    
-                    response = client.models.generate_content(
-                        model=gemini_model,
-                        contents=gemini_prompt,
-                        config={"temperature": 0.1}
-                    )
-                    response_text = response.text or "SELECT * FROM DEPARTMENTS"
-                elif API_KEY or os.getenv("OPENAI_API_KEY"):
-                    completion = client.chat.completions.create(
-                        model=MODEL_NAME,
-                        messages=messages,
-                        temperature=0.1,
-                        stream=False
-                    )
-                    response_text = completion.choices[0].message.content or "SELECT * FROM DEPARTMENTS"
-                else:
-                    response_text = "SELECT * FROM DEPARTMENTS"  # Dummy mode
-
-            except Exception as e:
-                print(f"Model Request failed: {e}. Using fallback action.")
-                response_text = "SELECT 1"
+            completion = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                temperature=0.0,
+                seed=OPENAI_SEED,
+                stream=False,
+            )
+            response_text = completion.choices[0].message.content or "SELECT 1"
 
             action_str = parse_model_action(response_text)
             print(f"\n[Step {step}] Model suggested: {action_str}")
-            
+            current_task_id = observation.task_id
             result = env.step(SqlAction(query=action_str))
             observation = result.observation
             reward = result.reward
             done = result.done
 
             print(f"  Reward: {reward:+.2f} | Done: {done}")
+            print(f"  Task Score: {observation.task_score:.3f} | Difficulty: {observation.difficulty}")
+            if observation.grader_feedback:
+                print(f"  Grader: {observation.grader_feedback}")
             if observation.execution_error:
                 print(f"  Error: {observation.execution_error[:200]}")
+
+            if observation.task_score > 0:
+                task_scores[current_task_id] = max(task_scores.get(current_task_id, 0.0), observation.task_score)
                 
             history.append(f"Q: {action_str} -> R: {reward:+.2f}")
+            run_trace.append(
+                {
+                    "step": step,
+                    "task_id": current_task_id,
+                    "action": action_str,
+                    "reward": reward,
+                    "task_score": observation.task_score,
+                    "done": done,
+                }
+            )
             
             if done:
                 print("\nAll tasks complete!")
                 break
-                
+
+        print("\n=== Baseline Summary ===")
+        for task_id in sorted(task_scores):
+            print(f"{task_id}: {task_scores[task_id]:.3f}")
+        task_avg = (sum(task_scores.values()) / len(task_scores)) if task_scores else 0.0
+        total_return = sum(item["reward"] for item in run_trace)
+        print(f"average_task_score: {task_avg:.3f}")
+        print(f"episode_return: {total_return:.3f}")
+        print(f"model: {MODEL_NAME} | seed: {OPENAI_SEED}")
+        print("reproducibility_note: deterministic prompt, temperature=0.0, fixed seed")
+
     finally:
         env.close()
 

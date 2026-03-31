@@ -3,5 +3,5 @@ pydantic>=2.7.1
 uvicorn>=0.30.1
 openenv-core
 pandas
-google-genai
+openai
 python-dotenv
