@@ -1,5 +1,5 @@
 ---
-title: SQL AI Data Analyst
+title: SQL-RL (OpenEnv)
 emoji: 📊
 colorFrom: blue
 colorTo: green
@@ -9,7 +9,7 @@ pinned: false
 tags:
   - openenv
 ---
-# OpenEnv SQL Data Analyst
+# SQL-RL (OpenEnv)
 
 ## Environment Description and Motivation
 This environment simulates a real business workflow: a data analyst converting stakeholder requests into executable SQL over an internal company warehouse.

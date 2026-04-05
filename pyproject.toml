@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sqlagent-openenv"
 version = "0.1.0"
-description = "OpenEnv SQL data analyst environment for real-world agent evaluation"
+description = "SQL-RL (OpenEnv): SQL analytics environment with deterministic graders for agent evaluation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
