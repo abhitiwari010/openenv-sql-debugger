@@ -1,60 +1,141 @@
+"""
+SQL Data Analyst OpenEnv — baseline inference (hackathon format).
+
+Environment variables (set before running):
+  HF_TOKEN         Primary API key (Hugging Face / OpenAI-compatible).
+  API_BASE_URL     LLM base URL (e.g. https://api.openai.com/v1 or HF router).
+  MODEL_NAME       Model id for chat completions.
+  OPENAI_API_KEY   Optional fallback if HF_TOKEN is unset.
+  API_KEY          Optional second fallback.
+
+Optional:
+  SQL_AGENT_TASK      Logged as task= in [START] (default: sql_analyst_episode).
+  SQL_AGENT_BENCHMARK Logged as env= in [START] (default: sql_agent_openenv).
+  MAX_STEPS           Max env.step calls (default: 24).
+  OPENAI_SEED         Passed to OpenAI only when base URL looks like OpenAI.
+  ENV_CONTAINER_START true to use SqlEnvClient.from_docker_image (default: false).
+  IMAGE_NAME / LOCAL_IMAGE_NAME / ENV_IMAGE_NAME  Docker image tag when using container.
+"""
+
+from __future__ import annotations
+
 import os
+import re
+import sys
 import textwrap
-from openai import OpenAI
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional
+
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
 
 from client import SqlEnvClient
 from models import SqlAction
 
-# OpenEnv execution environment config
-ENV_CONTAINER_START = os.getenv("ENV_CONTAINER_START", "false").lower() == "true"
-ENV_IMAGE_NAME = "sql-agent-env:latest"
-
-# LLM inference config as per instructions
+# --- Mandatory hackathon configuration ---
 API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
-API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
-MAX_STEPS = int(os.getenv("MAX_STEPS", "20"))
+API_KEY = (
+    os.getenv("HF_TOKEN")
+    or os.getenv("OPENAI_API_KEY")
+    or os.getenv("API_KEY")
+)
+
+TASK_NAME = os.getenv("SQL_AGENT_TASK", "sql_analyst_episode")
+BENCHMARK = os.getenv("SQL_AGENT_BENCHMARK", "sql_agent_openenv")
+
+MAX_STEPS = int(os.getenv("MAX_STEPS", "24"))
 OPENAI_SEED = int(os.getenv("OPENAI_SEED", "42"))
+
+ENV_CONTAINER_START = os.getenv("ENV_CONTAINER_START", "false").lower() == "true"
+ENV_IMAGE_NAME = (
+    os.getenv("LOCAL_IMAGE_NAME")
+    or os.getenv("IMAGE_NAME")
+    or os.getenv("ENV_IMAGE_NAME", "sql-agent-env:latest")
+)
+
+# Grader task ids (must match core/tasks.py) for normalized [END] score in [0, 1]
+TASK_IDS = [
+    "employee_payroll_overview",
+    "department_budget_summary",
+    "senior_engineering_comp_review",
+]
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
     You are an expert Data Analyst and SQL Agent.
     You will be provided with a SQL Schema and an instruction.
-    Reply with exactly one JSON block containing the SQL query to execute.
-    Do NOT provide markdown formatting or explanations. DO NOT wrap in ```sql.
-    The response should be the pure string of the query itself.
+    Reply with exactly one SQL query string to execute.
+    Do NOT use markdown fences or explanations — only the raw SQL text.
     """
 ).strip()
 
-def build_user_prompt(step: int, observation, history: List[str]) -> str:
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(
+    step: int,
+    action: str,
+    reward: float,
+    done: bool,
+    error: Optional[str],
+) -> None:
+    err = error if error else "null"
+    err_one = sanitize_one_line(err) if err != "null" else "null"
+    act_one = sanitize_one_line(action)
+    done_val = str(done).lower()
+    print(
+        f"[STEP] step={step} action={act_one} reward={reward:.2f} done={done_val} error={err_one}",
+        flush=True,
+    )
+
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    # Evaluators expect a comma-separated list; use 0.00 if no steps ran.
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards) if rewards else "0.00"
+    print(
+        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}",
+        flush=True,
+    )
+
+
+def sanitize_one_line(s: str) -> str:
+    if not s:
+        return ""
+    return " ".join(s.split())
+
+
+def build_user_prompt(step: int, observation: Any, history: List[str]) -> str:
     schema = observation.schema_info
     instruction = observation.current_task_instruction
     exec_result = observation.execution_result or "None"
     error = observation.execution_error or "None"
-    
-    prompt = textwrap.dedent(
+    history_block = "\n".join(history[-6:]) if history else "None"
+    return textwrap.dedent(
         f"""
         Step: {step}
         Database Schema:
         {schema}
-        
+
         Task Instruction:
         {instruction}
-        
+
         Previous Execution Result: {exec_result}
         Previous Error: {error}
-        
+
+        Recent history:
+        {history_block}
+
         Write the precise SQL query string to accomplish the task instruction. Return nothing else.
         """
     ).strip()
-    return prompt
+
 
 def parse_model_action(response_text: str) -> str:
-    query = response_text.strip()
+    query = (response_text or "").strip()
     if query.startswith("```sql"):
         query = query[6:]
     if query.startswith("```"):
@@ -63,120 +144,141 @@ def parse_model_action(response_text: str) -> str:
         query = query[:-3]
     return query.strip()
 
-def main():
+
+def _make_direct_client():
+    from server.environment import SqlEnvironment
+
+    base_env = SqlEnvironment()
+
+    class DirectClient:
+        def __init__(self, target):
+            self.target = target
+
+        def reset(self):
+            obs = self.target.reset()
+            return type(
+                "StepResult",
+                (),
+                {"observation": obs, "reward": 0.0, "done": False},
+            )()
+
+        def step(self, action):
+            obs = self.target.step(action)
+            return type(
+                "StepResult",
+                (),
+                {
+                    "observation": obs,
+                    "reward": obs.reward if obs.reward is not None else 0.0,
+                    "done": obs.done,
+                },
+            )()
+
+        def close(self):
+            pass
+
+    return DirectClient(base_env)
+
+
+def main() -> None:
     if not API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is required for reproducible baseline runs.")
+        print(
+            "[DEBUG] Set HF_TOKEN (or OPENAI_API_KEY) before running.",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise RuntimeError(
+            "Missing API key: set HF_TOKEN or OPENAI_API_KEY for OpenAI-compatible client."
+        )
 
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-    print("--- SQL Data Analyst OpenEnv Baseline ---")
-    
     if ENV_CONTAINER_START:
-        print(f"Starting docker image: {ENV_IMAGE_NAME}")
+        print(f"[DEBUG] Using docker image: {ENV_IMAGE_NAME}", file=sys.stderr, flush=True)
         env = SqlEnvClient.from_docker_image(ENV_IMAGE_NAME).sync()
     else:
-        # Fallback to local memory-bound initialization
-        from server.environment import SqlEnvironment
-        base_env = SqlEnvironment()
-        
-        # Direct wrapper
-        class DirectClient:
-            def __init__(self, target):
-                self.target = target
-            def reset(self):
-                obs = self.target.reset()
-                return type('StepResult', (), {'observation': obs, 'reward': 0.0, 'done': False})()
-            def step(self, action):
-                obs = self.target.step(action)
-                return type(
-                    'StepResult',
-                    (),
-                    {
-                        'observation': obs,
-                        'reward': obs.reward if obs.reward is not None else 0.0,
-                        'done': obs.done,
-                    },
-                )()
-            def close(self):
-                pass
-        env = DirectClient(base_env)
+        env = _make_direct_client()
 
     history: List[str] = []
-    task_scores: Dict[str, float] = {}
-    run_trace: List[Dict[str, Any]] = []
-    
+    rewards: List[float] = []
+    best_task_score: Dict[str, float] = {tid: 0.0 for tid in TASK_IDS}
+
+    steps_taken = 0
+    score = 0.0
+    success = False
+    last_done = False
+
+    log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
+
     try:
         result = env.reset()
         observation = result.observation
-        print(f"\n[Episode Start] Initial Task: {observation.current_task_instruction}")
-        
+
         for step in range(1, MAX_STEPS + 1):
             if result.done:
-                print("Environment signalled done. Stopping early.")
                 break
-                
+
             user_prompt = build_user_prompt(step, observation, history)
-            
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ]
-            
-            completion = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                temperature=0.0,
-                seed=OPENAI_SEED,
-                stream=False,
-            )
-            response_text = completion.choices[0].message.content or "SELECT 1"
+
+            create_kwargs: Dict[str, Any] = {
+                "model": MODEL_NAME,
+                "messages": messages,
+                "temperature": 0.0,
+                "stream": False,
+            }
+            if re.search(r"openai\.com", API_BASE_URL, re.I):
+                create_kwargs["seed"] = OPENAI_SEED
+
+            try:
+                completion = client.chat.completions.create(**create_kwargs)
+                response_text = completion.choices[0].message.content or "SELECT 1"
+            except Exception as exc:
+                print(f"[DEBUG] Model request failed: {exc}", file=sys.stderr, flush=True)
+                response_text = "SELECT 1"
 
             action_str = parse_model_action(response_text)
-            print(f"\n[Step {step}] Model suggested: {action_str}")
-            current_task_id = observation.task_id
             result = env.step(SqlAction(query=action_str))
             observation = result.observation
-            reward = result.reward
-            done = result.done
+            reward = float(result.reward if result.reward is not None else 0.0)
+            done = bool(result.done)
+            last_done = done
 
-            print(f"  Reward: {reward:+.2f} | Done: {done}")
-            print(f"  Task Score: {observation.task_score:.3f} | Difficulty: {observation.difficulty}")
-            if observation.grader_feedback:
-                print(f"  Grader: {observation.grader_feedback}")
-            if observation.execution_error:
-                print(f"  Error: {observation.execution_error[:200]}")
+            err_raw = observation.execution_error
+            rewards.append(reward)
+            steps_taken = step
 
-            if observation.task_score > 0:
-                task_scores[current_task_id] = max(task_scores.get(current_task_id, 0.0), observation.task_score)
-                
-            history.append(f"Q: {action_str} -> R: {reward:+.2f}")
-            run_trace.append(
-                {
-                    "step": step,
-                    "task_id": current_task_id,
-                    "action": action_str,
-                    "reward": reward,
-                    "task_score": observation.task_score,
-                    "done": done,
-                }
-            )
-            
+            tid = getattr(observation, "task_id", None)
+            if tid in best_task_score:
+                best_task_score[tid] = max(
+                    best_task_score[tid], float(observation.task_score or 0.0)
+                )
+
+            log_step(step=step, action=action_str, reward=reward, done=done, error=err_raw)
+
+            history.append(f"Q: {action_str[:200]} -> R: {reward:+.2f}")
+
             if done:
-                print("\nAll tasks complete!")
                 break
 
-        print("\n=== Baseline Summary ===")
-        for task_id in sorted(task_scores):
-            print(f"{task_id}: {task_scores[task_id]:.3f}")
-        task_avg = (sum(task_scores.values()) / len(task_scores)) if task_scores else 0.0
-        total_return = sum(item["reward"] for item in run_trace)
-        print(f"average_task_score: {task_avg:.3f}")
-        print(f"episode_return: {total_return:.3f}")
-        print(f"model: {MODEL_NAME} | seed: {OPENAI_SEED}")
-        print("reproducibility_note: deterministic prompt, temperature=0.0, fixed seed")
+        score = sum(best_task_score[t] for t in TASK_IDS) / len(TASK_IDS)
+        score = min(max(score, 0.0), 1.0)
+        # Success: episode ended in terminal success state with strong average task score
+        success = last_done and score >= 0.95
 
+    except Exception as exc:
+        print(f"[DEBUG] Episode error: {exc}", file=sys.stderr, flush=True)
+        success = False
     finally:
-        env.close()
+        try:
+            env.close()
+        except Exception as exc:
+            print(f"[DEBUG] env.close() error: {exc}", file=sys.stderr, flush=True)
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+
 
 if __name__ == "__main__":
     main()

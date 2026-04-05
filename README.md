@@ -67,31 +67,59 @@ Episode ends when all tasks are solved or max attempts for a task are exhausted.
    ```bash
    pip install -r requirements.txt
    ```
-2. Set API key for baseline:
+2. Set **hackathon-required** variables (OpenAI-compatible client):
    ```bash
-   export OPENAI_API_KEY="your-key"
+   export HF_TOKEN="your-api-key"
+   export API_BASE_URL="https://api.openai.com/v1"
+   export MODEL_NAME="gpt-4o-mini"
    ```
-3. Run baseline:
+   `HF_TOKEN` is preferred; `OPENAI_API_KEY` or `API_KEY` are accepted as fallbacks.
+3. Run baseline (root `inference.py`):
    ```bash
    python inference.py
    ```
 
-The baseline uses the OpenAI API client with deterministic settings:
-- `temperature=0.0`
-- fixed seed (`OPENAI_SEED`, default `42`)
-- fixed task order and deterministic grader
+The baseline uses the **OpenAI Python client** (`openai.OpenAI`) with `base_url=API_BASE_URL` and `api_key=HF_TOKEN` (or fallback). For reproducibility on the official OpenAI API, `temperature=0.0` and `seed=OPENAI_SEED` (default `42`) are used when `API_BASE_URL` points at OpenAI.
+
+### Mandatory stdout format (for automated judging)
+`inference.py` prints **only** these structured lines to **stdout** (debug goes to **stderr**):
+
+- `[START] task=<name> env=<benchmark> model=<model>`
+- `[STEP] step=<n> action=<sql> reward=<0.00> done=<true|false> error=<msg|null>`
+- `[END] success=<true|false> steps=<n> score=<0.000> rewards=<r1,r2,...>`
+
+`[END] score` is the mean of best grader scores seen for the three tasks (each in `[0, 1]`). `success` is `true` when the episode ends with `done` and that mean score is ≥ `0.95`.
+
+## Pre-submission validation
+Before submitting, run:
+```bash
+python hf/pre-validation-script.py
+```
+This checks files, the stdout contract in `inference.py`, syntax, and `openenv validate` (if the CLI is installed).
 
 ## Baseline Score Reporting
-`inference.py` prints:
-- per-task best score
-- average task score
-- episode return
-- model and seed used
+Structured `[END]` line carries the aggregate score and per-step rewards; use stderr `[DEBUG]` lines only for local troubleshooting.
 
-This creates reproducible benchmark records for easy/medium/hard tasks.
+## Deploy to Hugging Face Spaces (spec checklist)
+1. **Create a Space** → **Docker** template, or link this GitHub repo to a Space.
+2. **README frontmatter** (top of this file) must stay valid YAML:
+   - `sdk: docker`
+   - `app_port: 7860` (must match `openenv.yaml` `port` and the container listen port)
+   - `tags:` includes `openenv`
+3. **Build**: HF runs `docker build` on the repo root; entrypoint is `Dockerfile` `CMD` → Uvicorn on `0.0.0.0:$PORT` (default **7860**).
+4. **Health**: platform probes your app; this repo exposes **`GET /health`** and OpenEnv **`POST /reset`** for automated checks.
+5. **Push** the same commit you validated locally (`openenv validate`, `python hf/pre-validation-script.py`).
+
+Local smoke test (matches CI-style build):
+```bash
+docker build -t sql-agent-env .
+docker run --rm -p 7860:7860 -e PORT=7860 sql-agent-env
+# Then open http://localhost:7860/health and http://localhost:7860/
+```
 
 ## Docker and Hugging Face Space
-- `Dockerfile` is included and starts `uvicorn server.app:app`.
+- `Dockerfile` runs `uvicorn server.app:app` with **`PORT`** from the environment (default **7860**).
+- `.dockerignore` excludes `.env` and build junk so secrets are not copied into the image.
 - Space metadata is configured in this `README.md` frontmatter with `sdk: docker`.
 - Health endpoint: `/health`
 - **Web playground:** open the Space URL (`/`). Click **Connect session** to open a WebSocket to `/ws`, then **Start episode (reset)** and **Run query (step)**. OpenEnv’s HTTP `POST /reset` and `POST /step` each use a fresh environment instance (stateless); the WebSocket session keeps one episode alive for the UI.

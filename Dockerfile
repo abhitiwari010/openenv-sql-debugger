@@ -14,12 +14,14 @@ COPY . /app/
 
 # Environment configurations setup
 ENV PYTHONPATH="/app"
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:7860/health || exit 1
+# Hugging Face Spaces may set PORT; must match README `app_port` (7860).
+ENV PORT=7860
 
 EXPOSE 7860
 
-# Run server with updated root OOP Path
-CMD ["uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", "7860"]
+# Health check uses same default PORT as CMD (Spaces usually leave PORT=7860)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=5 \
+    CMD sh -c 'curl -fsS "http://127.0.0.1:${PORT}/health" || exit 1'
+
+# OpenEnv app: FastAPI ASGI at server.app:app (see openenv.yaml)
+CMD ["sh", "-c", "exec uvicorn server.app:app --host 0.0.0.0 --port ${PORT}"]

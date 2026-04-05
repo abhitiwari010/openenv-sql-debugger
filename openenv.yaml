@@ -1,5 +1,6 @@
 spec_version: 1
 name: sql-agent-env
+description: OpenEnv SQL data analyst — schema → SQL tasks with deterministic graders
 type: space
 runtime: fastapi
 app: server.app:app
