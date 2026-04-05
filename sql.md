@@ -1,0 +1,34 @@
+# RL - Answer
+
+```sql
+SELECT NAME, SALARY 
+FROM EMPLOYEES 
+ORDER BY SALARY DESC;
+```
+
+```sql
+SELECT 
+    d.NAME AS DEPARTMENT_NAME, 
+    AVG(e.SALARY) AS AVG_SALARY
+FROM 
+    DEPARTMENTS d
+JOIN 
+    EMPLOYEES e ON d.ID = e.DEPARTMENT_ID
+GROUP BY 
+    d.NAME;
+```
+
+```sql
+SELECT 
+    e.NAME, 
+    r.TITLE
+FROM 
+    EMPLOYEES e
+JOIN 
+    DEPARTMENTS d ON e.DEPARTMENT_ID = d.ID
+JOIN 
+    ROLES r ON r.TITLE = 'Senior'
+WHERE 
+    d.NAME = 'Engineering' 
+    AND e.SALARY >= r.MIN_SALARY;
+```
