@@ -215,6 +215,13 @@
     }
     .status-bar.ok { color: var(--accent); }
     .status-bar.bad { color: var(--err); }
+    .sql-hint {
+      font-size: 0.88rem;
+      line-height: 1.5;
+      color: var(--muted);
+      margin: 0 0 0.65rem;
+    }
+    .sql-hint code { font-family: "JetBrains Mono", monospace; font-size: 0.8rem; }
   </style>
 </head>
 <body>
@@ -232,6 +239,8 @@
     <p class="status-bar" style="margin:-0.5rem 0 1.25rem;">
       Interactive mode uses a persistent <strong>WebSocket</strong> session at <code>/ws</code>
       (OpenEnv HTTP <code>/step</code> is stateless). Connect, then run reset → SQL steps.
+      The <strong>task</strong> is shown in natural language; each <strong>step</strong> must be SQL (OpenEnv action space).
+      To drive the env from plain English automatically, use the <code>inference.py</code> LLM baseline — not this textarea.
     </p>
 
     <div class="grid">
@@ -250,7 +259,10 @@
 
       <div class="panel full">
         <h2>Your SQL</h2>
-        <textarea id="sql" placeholder="SELECT ..."></textarea>
+        <p class="sql-hint">
+          Type <strong>only valid SQLite</strong> here. Natural language is not executed as SQL — English belongs in the task description (left), not in this box.
+        </p>
+        <textarea id="sql" placeholder="Executable SQL only, e.g. SELECT department_id, AVG(salary) ..."></textarea>
         <div class="actions">
           <button type="button" class="primary" id="btnConnect">Connect session</button>
           <button type="button" class="primary" id="btnReset" disabled>Start episode (reset)</button>
