@@ -1,5 +1,4 @@
 import uuid
-from typing import Tuple
 
 from openenv.core.env_server import Environment
 from models import SqlAction, SqlObservation, SqlState, SqlReward
@@ -35,13 +34,17 @@ class SqlEnvironment(Environment):
             difficulty=first_task.difficulty_label,
         )
 
+    @property
     def state(self) -> SqlState:
         return self._state
 
-    def step(self, action: SqlAction) -> Tuple[SqlObservation, float, bool]:
+    def step(self, action: SqlAction) -> SqlObservation:
         self._state.step_count += 1
         query = action.query.strip()
         current_idx = self._state.current_task_index
+        n_tasks = self.task_registry.get_total_tasks()
+        while len(self._state.attempts_per_task) < n_tasks:
+            self._state.attempts_per_task.append(0)
         task = self.task_registry.get_task(current_idx)
         self._state.attempts_per_task[current_idx] += 1
         
@@ -135,6 +138,8 @@ class SqlEnvironment(Environment):
             execution_error=error_str,
             task_score=score,
             grader_feedback=grader_feedback,
+            reward=reward.total,
+            done=done,
         )
-        
-        return obs, reward.total, done
+
+        return obs

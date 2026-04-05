@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from openenv.core.env_server import create_fastapi_app
 from fastapi.responses import HTMLResponse
 import os
@@ -8,25 +10,13 @@ from server.environment import SqlEnvironment
 
 app = create_fastapi_app(SqlEnvironment, SqlAction, SqlObservation)
 
+_PLAYGROUND_HTML = Path(__file__).resolve().parent / "playground.html"
+
 
 @app.get("/")
 def root():
-    return HTMLResponse(
-        """
-        <html>
-          <head><title>SQL OpenEnv Space</title></head>
-          <body style="font-family: sans-serif; margin: 2rem;">
-            <h2>SQL Data Analyst OpenEnv Environment</h2>
-            <p>Environment is running.</p>
-            <ul>
-              <li>Health check: <a href="/health">/health</a></li>
-              <li>OpenAPI docs: <a href="/docs">/docs</a></li>
-            </ul>
-            <p>Use the OpenEnv client in <code>inference.py</code> to run baseline episodes.</p>
-          </body>
-        </html>
-        """
-    )
+    html = _PLAYGROUND_HTML.read_text(encoding="utf-8")
+    return HTMLResponse(html)
 
 
 @app.get("/health")

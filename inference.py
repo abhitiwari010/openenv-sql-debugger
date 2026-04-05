@@ -87,8 +87,16 @@ def main():
                 obs = self.target.reset()
                 return type('StepResult', (), {'observation': obs, 'reward': 0.0, 'done': False})()
             def step(self, action):
-                obs, reward, done = self.target.step(action)
-                return type('StepResult', (), {'observation': obs, 'reward': reward, 'done': done})()
+                obs = self.target.step(action)
+                return type(
+                    'StepResult',
+                    (),
+                    {
+                        'observation': obs,
+                        'reward': obs.reward if obs.reward is not None else 0.0,
+                        'done': obs.done,
+                    },
+                )()
             def close(self):
                 pass
         env = DirectClient(base_env)

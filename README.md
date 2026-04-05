@@ -94,6 +94,7 @@ This creates reproducible benchmark records for easy/medium/hard tasks.
 - `Dockerfile` is included and starts `uvicorn server.app:app`.
 - Space metadata is configured in this `README.md` frontmatter with `sdk: docker`.
 - Health endpoint: `/health`
+- **Web playground:** open the Space URL (`/`). Click **Connect session** to open a WebSocket to `/ws`, then **Start episode (reset)** and **Run query (step)**. OpenEnv’s HTTP `POST /reset` and `POST /step` each use a fresh environment instance (stateless); the WebSocket session keeps one episode alive for the UI.
 
 Local container run:
 ```bash
