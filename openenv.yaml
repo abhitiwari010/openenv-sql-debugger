@@ -5,3 +5,20 @@ type: space
 runtime: fastapi
 app: server.app:app
 port: 7860
+
+tasks:
+  - id: employee_payroll_overview
+    name: "Employee Payroll Overview"
+    description: "EASY: As an HR analyst, list all employee names and salaries ordered by salary descending for payroll review."
+    difficulty: easy
+    grader: core.grader:DataFrameGrader.grade
+  - id: department_budget_summary
+    name: "Department Budget Summary"
+    description: "MEDIUM: As a finance analyst, return each department name with average salary. Output columns must be 'DEPARTMENT_NAME' and 'AVG_SALARY'."
+    difficulty: medium
+    grader: core.grader:DataFrameGrader.grade
+  - id: senior_engineering_comp_review
+    name: "Senior Engineering Comp Review"
+    description: "HARD: For compensation review, find Engineering employees whose salary qualifies for the 'Senior' role threshold. Return employee NAME and role TITLE."
+    difficulty: hard
+    grader: core.grader:DataFrameGrader.grade
