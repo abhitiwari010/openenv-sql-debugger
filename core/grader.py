@@ -33,7 +33,7 @@ class DataFrameGrader:
 
             if not same_col_set:
                 return {
-                    "score": 0.0,
+                    "score": 0.0001,
                     "feedback": f"Column mismatch. Expected {expected_cols}, got {agent_cols}.",
                     "details": {"column_score": 0.0, "row_count_score": 0.0, "row_content_score": 0.0},
                 }
@@ -54,8 +54,10 @@ class DataFrameGrader:
             denom = max(1, sum(expected_rows.values()))
             row_content_score = 0.4 * (overlap / denom)
 
-            score = round(min(1.0, col_score + row_count_score + row_content_score), 4)
-            feedback = "Exact match." if score == 1.0 else "Partially correct result."
+            score = round(min(0.9999, col_score + row_count_score + row_content_score), 4)
+            if score <= 0.0:
+                score = 0.0001
+            feedback = "Exact match." if score >= 0.95 else "Partially correct result."
             return {
                 "score": score,
                 "feedback": feedback,
@@ -67,7 +69,7 @@ class DataFrameGrader:
             }
         except Exception as exc:
             return {
-                "score": 0.0,
+                "score": 0.0001,
                 "feedback": f"Grader failed: {exc}",
                 "details": {"column_score": 0.0, "row_count_score": 0.0, "row_content_score": 0.0},
             }
