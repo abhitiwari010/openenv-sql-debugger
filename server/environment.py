@@ -50,9 +50,9 @@ class SqlEnvironment(Environment):
         
         execution_result_str = None
         error_str = None
-        score = 0.0
+        score = 0.0001
         grader_feedback = ""
-        reward = SqlReward(total=0.0, task_score=0.0)
+        reward = SqlReward(total=0.0, task_score=0.0001)
         done = False
 
         query_lower = query.lower()

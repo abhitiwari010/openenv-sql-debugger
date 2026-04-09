@@ -14,7 +14,7 @@ class SqlObservation(Observation):
     difficulty: str
     execution_result: Optional[str] = None
     execution_error: Optional[str] = None
-    task_score: float = 0.0
+    task_score: float = 0.0001
     grader_feedback: Optional[str] = None
 
 
