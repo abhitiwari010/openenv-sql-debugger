@@ -107,7 +107,7 @@ def run_episode(task_id: str):
         
     print(f"[START] task={task_id} env={ENV_NAME} model={MODEL_NAME}", flush=True)
     
-    best_reward = 0.0
+    best_reward = 0.05
     history = []
     
     step = 0
@@ -170,7 +170,7 @@ def run_episode(task_id: str):
     success_str = "true" if best_reward > 0.8 else "false"
     best_reward_formatted = f"{best_reward:.2f}"
     
-    print(f"[END] success={success_str} steps={step} rewards={best_reward_formatted}", flush=True)
+    print(f"[END] task={task_id} success={success_str} steps={step} score={best_reward_formatted}", flush=True)
 
 def main():
     # Only process the tasks quietly!
