@@ -73,8 +73,7 @@ SYSTEM_PROMPT = textwrap.dedent(
 
 
 def log_start(task: str, env: str, model: str) -> None:
-    print(f"[START] task={task} env={env} model={model}", flush=True)
-
+    print(f"[START] task={task} env={env} model={model}")
 
 def log_step(
     step: int,
@@ -83,23 +82,14 @@ def log_step(
     done: bool,
     error: Optional[str],
 ) -> None:
-    err = error if error else "null"
-    err_one = sanitize_one_line(err) if err != "null" else "null"
+    err_one = sanitize_one_line(error) if error else "null"
     act_one = sanitize_one_line(action)
-    done_val = str(done).lower()
-    print(
-        f"[STEP] step={step} action={act_one} reward={reward:.2f} done={done_val} error={err_one}",
-        flush=True,
-    )
+    done_val = "true" if done else "false"
+    print(f"[STEP]  step={step} action={act_one} reward={reward:.2f} done={done_val} error={err_one}")
 
-
-def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
-    # Evaluators expect a comma-separated list; use 0.00 if no steps ran.
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards) if rewards else "0.00"
-    print(
-        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}",
-        flush=True,
-    )
+def log_end(success: bool, steps: int, score: float) -> None:
+    succ_val = "true" if success else "false"
+    print(f"[END]   success={succ_val} steps={steps} rewards={score:.2f}")
 
 
 def sanitize_one_line(s: str) -> str:
@@ -182,37 +172,24 @@ def _make_direct_client():
 
 def main() -> None:
     if not API_KEY:
-        print(
-            "[DEBUG] Set HF_TOKEN (or OPENAI_API_KEY) before running.",
-            file=sys.stderr,
-            flush=True,
-        )
-        raise RuntimeError(
-            "Missing API key: set HF_TOKEN or OPENAI_API_KEY for OpenAI-compatible client."
-        )
+        sys.exit(1)
 
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
     if ENV_CONTAINER_START:
-        print(f"[DEBUG] Using docker image: {ENV_IMAGE_NAME}", file=sys.stderr, flush=True)
         env = SqlEnvClient.from_docker_image(ENV_IMAGE_NAME).sync()
     else:
         env = _make_direct_client()
 
     history: List[str] = []
-    rewards: List[float] = []
-    best_task_score: Dict[str, float] = {tid: 0.0 for tid in TASK_IDS}
-
-    steps_taken = 0
-    score = 0.0
-    success = False
-    last_done = False
-
-    log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
-
+    
     try:
         result = env.reset()
         observation = result.observation
+        
+        current_task_id = observation.task_id
+        task_step = 1
+        log_start(task=current_task_id, env=BENCHMARK, model=MODEL_NAME)
 
         for step in range(1, MAX_STEPS + 1):
             if result.done:
@@ -236,48 +213,47 @@ def main() -> None:
             try:
                 completion = client.chat.completions.create(**create_kwargs)
                 response_text = completion.choices[0].message.content or "SELECT 1"
-            except Exception as exc:
-                print(f"[DEBUG] Model request failed: {exc}", file=sys.stderr, flush=True)
+            except Exception:
                 response_text = "SELECT 1"
 
             action_str = parse_model_action(response_text)
             result = env.step(SqlAction(query=action_str))
             observation = result.observation
-            reward = float(result.reward if result.reward is not None else 0.0)
-            done = bool(result.done)
-            last_done = done
-
+            
+            # reward is obtained from observation task_score or directly from step
+            task_score = float(observation.task_score if hasattr(observation, 'task_score') and observation.task_score is not None else 0.0)
+            if hasattr(observation, 'reward') and observation.reward is not None:
+                task_score = float(observation.reward)
+                
             err_raw = observation.execution_error
-            rewards.append(reward)
-            steps_taken = step
+            next_task_id = getattr(observation, "task_id", None)
+            
+            # task transitions or episode done signals end of current task
+            task_done = (next_task_id != current_task_id) or result.done
+            
+            log_step(step=task_step, action=action_str, reward=task_score, done=task_done, error=err_raw)
 
-            tid = getattr(observation, "task_id", None)
-            if tid in best_task_score:
-                best_task_score[tid] = max(
-                    best_task_score[tid], float(observation.task_score or 0.0)
-                )
+            history.append(f"Q: {action_str[:200]} -> R: {task_score:+.2f}")
 
-            log_step(step=step, action=action_str, reward=reward, done=done, error=err_raw)
+            if task_done:
+                success = (task_score >= 0.95)
+                log_end(success=success, steps=task_step, score=task_score)
+                if result.done or not next_task_id:
+                    break
+                current_task_id = next_task_id
+                task_step = 1
+                log_start(task=current_task_id, env=BENCHMARK, model=MODEL_NAME)
+                history.clear()
+            else:
+                task_step += 1
 
-            history.append(f"Q: {action_str[:200]} -> R: {reward:+.2f}")
-
-            if done:
-                break
-
-        score = sum(best_task_score[t] for t in TASK_IDS) / len(TASK_IDS)
-        score = min(max(score, 0.0), 1.0)
-        # Success: episode ended in terminal success state with strong average task score
-        success = last_done and score >= 0.95
-
-    except Exception as exc:
-        print(f"[DEBUG] Episode error: {exc}", file=sys.stderr, flush=True)
-        success = False
+    except Exception:
+        pass
     finally:
         try:
             env.close()
-        except Exception as exc:
-            print(f"[DEBUG] env.close() error: {exc}", file=sys.stderr, flush=True)
-        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
