@@ -1,9 +1,10 @@
 name: sql-debugger-env
 version: "1.0.0"
 description: >
-  An RL environment for training AI agents to write, fix, and optimize
-  SQL queries against a real SQLite database with employees, departments,
-  projects and project assignments tables.
+  An RL environment for training AI agents to write, debug, and optimize
+  SQL queries against a real SQLite database. Three task types cover
+  real data analyst work: writing queries from specs, fixing broken SQL,
+  and optimizing slow correlated subqueries.
 
 tasks:
   - id: easy_01
@@ -11,42 +12,54 @@ tasks:
     difficulty: easy
     type: write_query
     grader: true
-    description: "Find Engineering employees with salary above 90000, return name and salary ordered by salary DESC"
+    description: >
+      Find all employees in the Engineering department with salary above 
+      90000. Return name and salary ordered by salary descending.
 
   - id: easy_02
     name: Count by department
     difficulty: easy
     type: write_query
     grader: true
-    description: "Count employees per department, return department and count ordered by count DESC"
+    description: >
+      Count how many employees are in each department. Return department 
+      name and count ordered by count descending.
 
   - id: medium_01
     name: Fix broken JOIN
     difficulty: medium
     type: fix_query
     grader: true
-    description: "Fix the broken JOIN query missing ON keyword and using wrong table alias in WHERE"
+    description: >
+      Fix the broken query that returns employees on active projects. 
+      Bugs: missing ON keyword in JOIN, wrong table alias in WHERE clause.
 
   - id: medium_02
     name: Fix wrong GROUP BY
     difficulty: medium
     type: fix_query
     grader: true
-    description: "Fix the GROUP BY clause that incorrectly groups by id instead of department"
+    description: >
+      Fix the query that computes average salary per department but 
+      incorrectly groups by id instead of department.
 
   - id: hard_01
     name: Optimize correlated subquery
     difficulty: hard
     type: optimize_query
     grader: true
-    description: "Replace correlated subqueries with window functions or CTEs to find top earner per department"
+    description: >
+      Replace correlated subqueries with window functions or CTEs to 
+      find the top earner per department with total hours worked.
 
   - id: hard_02
     name: Eliminate N+1 problem
     difficulty: hard
     type: optimize_query
     grader: true
-    description: "Rewrite N+1 correlated subquery using LEFT JOIN and GROUP BY"
+    description: >
+      Rewrite the N+1 correlated subquery using LEFT JOIN and GROUP BY 
+      to get department stats in a single efficient query.
 
 action_space:
   type: object
@@ -54,28 +67,46 @@ action_space:
     action_type:
       type: string
       enum: [write_query, fix_query, optimize_query]
+      description: The type of SQL action being taken
     sql:
       type: string
-      description: SQL SELECT statement
+      description: A valid SQLite SELECT statement
     explanation:
       type: string
-      description: Optional reasoning
+      description: Optional explanation of reasoning
 
 observation_space:
   type: object
   properties:
-    task_id: {type: string}
-    task_type: {type: string}
-    task_description: {type: string}
-    schema_info: {type: string}
-    sample_data: {type: string}
-    last_sql: {type: string}
-    last_result: {type: string}
-    last_error: {type: string}
-    step_count: {type: integer}
-    done: {type: boolean}
-    reward: {type: number, minimum: 0.05, maximum: 0.95}
-    feedback: {type: string}
+    task_id:
+      type: string
+    task_type:
+      type: string
+    task_description:
+      type: string
+    schema_info:
+      type: string
+      description: DDL schema of all tables
+    sample_data:
+      type: string
+      description: First 3 rows of each table
+    last_sql:
+      type: string
+    last_result:
+      type: string
+    last_error:
+      type: string
+    step_count:
+      type: integer
+    done:
+      type: boolean
+    reward:
+      type: number
+      minimum: 0.05
+      maximum: 0.95
+      description: Strictly between 0 and 1, never exactly 0.0 or 1.0
+    feedback:
+      type: string
 
 reward_range: [0.05, 0.95]
 max_steps_per_episode: 8

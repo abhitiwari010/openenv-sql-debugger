@@ -7,80 +7,114 @@ from openai import OpenAI
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-ENV_URL = os.getenv("ENV_URL", "http://localhost:8000") # defaults to common uvicorn port but user specified 7860
+ENV_URL = os.getenv("ENV_URL", "http://localhost:7860")
 MAX_STEPS = 6
 TEMPERATURE = 0.1
 MAX_TOKENS = 500
 
 client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-SYSTEM_PROMPT = """You are an expert SQL developer.
-For write_query tasks: write a correct SQL SELECT query.
-For fix_query tasks: fix the broken SQL provided.
-For optimize_query tasks: rewrite slow SQL using CTEs or JOINs instead of subqueries.
+SYSTEM_PROMPT = """You are an expert SQL developer working with a SQLite database.
 
-ALWAYS respond with ONLY a JSON object like this:
-{"action_type": "write_query", "sql": "SELECT ...", "explanation": "reason"}
+Your job depends on the task type:
+- write_query: Write a correct SQL SELECT query from scratch
+- fix_query: You are shown broken SQL. Fix it so it runs correctly
+- optimize_query: You are shown slow SQL. Rewrite it using CTEs (WITH clause) 
+  or window functions (ROW_NUMBER, RANK) instead of correlated subqueries
 
-Rules: Only SELECT allowed. No DROP DELETE INSERT UPDATE CREATE ALTER."""
+RESPONSE FORMAT — always respond with ONLY this JSON:
+{"action_type": "write_query", "sql": "SELECT ...", "explanation": "brief reason"}
 
-def build_prompt(obs: dict) -> str:
-    obs_data = obs.get("observation", obs)
-    task_desc = obs_data.get("task_description", "")
-    schema_info = obs_data.get("schema_info", "")
-    sample_data = obs_data.get("sample_data", "")
-    hints = obs_data.get("metadata", [])
-    last_sql = obs_data.get("last_sql", "")
-    last_result = obs_data.get("last_result", "")
-    last_error = obs_data.get("last_error", "")
-    step_count = obs_data.get("step_count", 0)
-    feedback = obs_data.get("feedback", "")
+RULES:
+- Only SELECT statements are allowed
+- No DROP, DELETE, INSERT, UPDATE, CREATE, ALTER, TRUNCATE
+- For fix_query: keep the same intent, just fix the bugs
+- For optimize_query: use WITH clause or window functions
+- Respond ONLY with the JSON object, no other text"""
+
+def build_prompt(obs: dict, step: int, history: list) -> str:
+    parts = []
+    parts.append(f"=== TASK ===\n{obs.get('task_description', '')}")
     
-    prompt = f"Task Description:\n{task_desc}\n\nSchema Info:\n{schema_info}\n\nSample Data:\n{sample_data}\n"
-    if hints:
-        prompt += f"\nHints: {', '.join(hints)}\n"
-    if last_sql:
-        prompt += f"\nLast SQL Submitted: {last_sql}\n"
-    if last_result:
-        prompt += f"Result of Last SQL: {last_result}\n"
-    if last_error:
-        prompt += f"Error Message: {last_error}\n"
-    if step_count > 0 and feedback:
-        prompt += f"Feedback from Grader: {feedback}\n"
+    schema = obs.get('schema_info', '')
+    if schema:
+        parts.append(f"=== DATABASE SCHEMA ===\n{chr(10).join(schema.split(chr(10))[:30])}")
         
-    prompt += "\nRespond with JSON action only."
-    return prompt
+    data = obs.get('sample_data', '')
+    if data:
+        parts.append(f"=== SAMPLE DATA ===\n{chr(10).join(data.split(chr(10))[:20])}")
+        
+    hints = obs.get('expected_description', '')
+    if hints:
+        parts.append(f"=== HINTS ===\n{hints}")
+        
+    last_sql = obs.get('last_sql')
+    if last_sql:
+        parts.append(f"=== YOUR PREVIOUS SQL ===\n{last_sql}")
+        
+    last_result = obs.get('last_result')
+    if last_result:
+        parts.append(f"=== RESULT OF PREVIOUS SQL ===\n{last_result}")
+        
+    last_error = obs.get('last_error')
+    if last_error:
+        parts.append(f"=== ERROR ===\n{last_error}")
+        
+    feedback = obs.get('feedback', '')
+    if feedback and step > 1:
+        parts.append(f"=== GRADER FEEDBACK ===\n{feedback}")
+        
+    if history:
+        hist_str = "\n".join(history[-3:])
+        parts.append(f"=== RECENT HISTORY ===\n{hist_str}")
+        
+    parts.append("Respond with ONLY a JSON action object.")
+    return "\n\n".join(parts)
 
 def parse_action(response_text: str, task_type: str) -> dict:
+    text = response_text.strip()
     try:
-        return json.loads(response_text)
+        return json.loads(text)
     except json.JSONDecodeError:
-        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        if json_match:
-            try:
-                return json.loads(json_match.group(0))
-            except json.JSONDecodeError:
-                pass
+        pass
         
-        sql_match = re.search(r'(?i)SELECT\s+.*', response_text, re.DOTALL)
-        sql = sql_match.group(0).strip() if sql_match else "SELECT 1"
-        if sql.endswith('```'): sql = sql[:-3].strip()
+    match = re.search(r'\{[^{}]+\}', text)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+            
+    sql_match = re.search(r'(?:SELECT|WITH).+', text, re.DOTALL | re.IGNORECASE)
+    if sql_match:
+        sql = sql_match.group(0).strip()
+        if sql.endswith("```"): sql = sql[:-3].strip()
+        return {"action_type": task_type, "sql": sql, "explanation": "Regex parsed"}
         
-        return {"action_type": task_type, "sql": sql, "explanation": "Fallback parsed"}
+    return {"action_type": task_type, "sql": "SELECT 1", "explanation": "parse failed"}
 
 def run_episode(task_id: str) -> dict:
-    res = requests.post(f"{ENV_URL}/reset", json={"task_id": task_id})
-    if res.status_code != 200:
+    try:
+        res = requests.post(f"{ENV_URL}/reset", json={"task_id": task_id, "difficulty": None})
+        res.raise_for_status()
+        obs_obj = res.json()
+        obs = obs_obj["observation"]
+    except Exception as e:
+        print(f"  Error resetting environment: {e}")
         return {"task_id": task_id, "best_reward": 0.05}
-    obs_obj = res.json()
+        
+    print(f"  Task: {task_id} | {obs.get('task_type', '')}")
+    print(f"  Desc: {obs.get('task_description', '')[:100]}...")
     
-    best_reward = 0.05
-    for step in range(MAX_STEPS):
-        obs = obs_obj.get("observation", obs_obj)
+    best_reward = 0.0
+    history = []
+    
+    for step in range(1, MAX_STEPS + 1):
         if obs.get("done", False):
+            print(f"  Done at step {step}")
             break
             
-        prompt = build_prompt(obs_obj)
+        prompt = build_prompt(obs, step, history)
         
         try:
             completion = client.chat.completions.create(
@@ -92,73 +126,81 @@ def run_episode(task_id: str) -> dict:
                 temperature=TEMPERATURE,
                 max_tokens=MAX_TOKENS
             )
-            response_text = completion.choices[0].message.content or "{}"
-        except Exception:
-            response_text = "{}"
+            response_text = completion.choices[0].message.content or ""
+        except Exception as e:
+            print(f"  API Error: {e}")
+            response_text = ""
             
         action = parse_action(response_text, obs.get("task_type", "write_query"))
         
-        res = requests.post(f"{ENV_URL}/step", json=action)
-        if res.status_code != 200:
+        print(f"    Step {step}: {action.get('sql', '')[:70]}...")
+        
+        try:
+            step_res = requests.post(f"{ENV_URL}/step", json=action)
+            step_res.raise_for_status()
+            step_data = step_res.json()
+        except Exception as e:
+            print(f"  Env Step Error: {e}")
             break
-        obs_obj = res.json()
-        reward = obs_obj.get("reward", 0.05)
-        
+            
+        reward = step_data.get("reward", 0.05)
         best_reward = max(best_reward, reward)
-        print(f"Step {step+1}: SQL={action.get('sql', '')[:60]}... Reward={reward:.3f} Feedback={obs_obj.get('observation', {}).get('feedback', '')}")
+        obs = step_data.get("observation", {})
         
-        if obs_obj.get("done", obs_obj.get("observation", {}).get("done", False)):
+        history.append(f"Step {step}: reward={reward:.3f} | {obs.get('feedback', '')[:60]}")
+        print(f"    Reward: {reward:.3f} | Done: {obs.get('done', False)} | {obs.get('feedback', '')[:60]}")
+        
+        if obs.get("done", False):
             break
             
     return {"task_id": task_id, "best_reward": round(best_reward, 3)}
 
 def main():
-    print(f"--- SQL Agent Inference ---")
-    print(f"Model: {MODEL_NAME}")
-    print(f"Env URL: {ENV_URL}")
+    print("=" * 65)
+    print("SQL Debugger OpenEnv — Baseline Inference")
+    print(f"Model : {MODEL_NAME}")
+    print(f"Env   : {ENV_URL}")
+    print("=" * 65)
     
-    health = {"status": "unreachable"}
     try:
-        health = requests.get(f"{ENV_URL}/health").json()
-    except Exception:
-        pass
-    print(f"Health: {health}")
-    
+        health_res = requests.get(f"{ENV_URL}/health")
+        print(f"Health: {health_res.json()}")
+    except Exception as e:
+        print(f"Health Check Failed: {e}")
+        
     task_ids = ["easy_01", "easy_02", "medium_01", "medium_02", "hard_01", "hard_02"]
     results = []
     
-    for tid in task_ids:
-        print(f"\n=== Task: {tid} ===")
+    for i, tid in enumerate(task_ids):
+        print(f"\\n[{i+1}/6] Running {tid}...")
         try:
             res = run_episode(tid)
         except Exception as e:
+            print(f"  Error running {tid}: {e}")
             res = {"task_id": tid, "best_reward": 0.05}
-            print(f"Error running task {tid}: {e}")
         results.append(res)
         
-    print("\n=== FINAL SCORES ===")
-    easy_scores = []
-    medium_scores = []
-    hard_scores = []
+    print("\n" + "=" * 65)
+    print("BASELINE SCORES")
+    print("=" * 65)
     
     for r in results:
-        t = r["task_id"]
-        v = r["best_reward"]
-        print(f"{t}: {v}")
-        if t.startswith("easy"): easy_scores.append(v)
-        elif t.startswith("medium"): medium_scores.append(v)
-        elif t.startswith("hard"): hard_scores.append(v)
+        print(f"  {r['task_id']:15s}: {r['best_reward']:.3f}")
         
+    easy_scores = [r['best_reward'] for r in results if r['task_id'].startswith('easy')]
+    medium_scores = [r['best_reward'] for r in results if r['task_id'].startswith('medium')]
+    hard_scores = [r['best_reward'] for r in results if r['task_id'].startswith('hard')]
+    
     easy_avg = sum(easy_scores)/len(easy_scores) if easy_scores else 0.0
     medium_avg = sum(medium_scores)/len(medium_scores) if medium_scores else 0.0
     hard_avg = sum(hard_scores)/len(hard_scores) if hard_scores else 0.0
-    overall = (easy_avg + medium_avg + hard_avg) / 3.0
+    overall = sum(r['best_reward'] for r in results) / len(results) if results else 0.0
     
-    print("\n--- AVERAGES ---")
-    print(f"Easy Average:   {easy_avg:.3f}")
-    print(f"Medium Average: {medium_avg:.3f}")
-    print(f"Hard Average:   {hard_avg:.3f}")
-    print(f"Overall Score:  {overall:.3f}")
+    print(f"\\nEasy average    : {easy_avg:.3f}")
+    print(f"Medium average  : {medium_avg:.3f}")
+    print(f"Hard average    : {hard_avg:.3f}")
+    print(f"Overall average : {overall:.3f}")
+    print("=" * 65)
 
 if __name__ == "__main__":
     main()
