@@ -1,8 +1,9 @@
 name: sql-debugger-env
 version: "1.0.0"
 description: >
-  RL environment for training AI agents to write, debug, and optimize SQL queries
-  against a real SQLite database with employees, departments, and projects.
+  An RL environment for training AI agents to write, fix, and optimize
+  SQL queries against a real SQLite database with employees, departments,
+  projects and project assignments tables.
 
 tasks:
   - id: easy_01
@@ -10,64 +11,71 @@ tasks:
     difficulty: easy
     type: write_query
     grader: true
-    description: "Find Engineering employees with salary above 90000"
-  
+    description: "Find Engineering employees with salary above 90000, return name and salary ordered by salary DESC"
+
   - id: easy_02
-    name: Count per department
+    name: Count by department
     difficulty: easy
     type: write_query
     grader: true
-    description: "Count employees per department, return department and count ordered by count DESC."
+    description: "Count employees per department, return department and count ordered by count DESC"
 
   - id: medium_01
     name: Fix broken JOIN
     difficulty: medium
     type: fix_query
     grader: true
-    description: "Fix a broken JOIN query (missing ON keyword, wrong table alias in WHERE). Return name and department name."
+    description: "Fix the broken JOIN query missing ON keyword and using wrong table alias in WHERE"
 
   - id: medium_02
-    name: Fix GROUP BY
+    name: Fix wrong GROUP BY
     difficulty: medium
     type: fix_query
     grader: true
-    description: "Fix wrong GROUP BY (should GROUP BY department not id) finding max salary per department."
+    description: "Fix the GROUP BY clause that incorrectly groups by id instead of department"
 
   - id: hard_01
     name: Optimize correlated subquery
     difficulty: hard
     type: optimize_query
     grader: true
-    description: "Replace correlated subquery with window function/CTE to find top earner per department with total hours."
+    description: "Replace correlated subqueries with window functions or CTEs to find top earner per department"
 
   - id: hard_02
-    name: Eliminate N+1 subqueries
+    name: Eliminate N+1 problem
     difficulty: hard
     type: optimize_query
     grader: true
-    description: "Eliminate N+1 subqueries using LEFT JOIN + GROUP BY to compute total hours per project."
+    description: "Rewrite N+1 correlated subquery using LEFT JOIN and GROUP BY"
 
 action_space:
   type: object
-  fields:
-    action_type: string
-    sql: string
-    explanation: string
+  properties:
+    action_type:
+      type: string
+      enum: [write_query, fix_query, optimize_query]
+    sql:
+      type: string
+      description: SQL SELECT statement
+    explanation:
+      type: string
+      description: Optional reasoning
 
 observation_space:
   type: object
-  fields:
-    task_id: string
-    task_type: string
-    task_description: string
-    schema_info: string
-    last_sql: string
-    last_result: string
-    last_error: string
-    step_count: integer
-    done: boolean
-    reward: float
-    feedback: string
+  properties:
+    task_id: {type: string}
+    task_type: {type: string}
+    task_description: {type: string}
+    schema_info: {type: string}
+    sample_data: {type: string}
+    last_sql: {type: string}
+    last_result: {type: string}
+    last_error: {type: string}
+    step_count: {type: integer}
+    done: {type: boolean}
+    reward: {type: number, minimum: 0.05, maximum: 0.95}
+    feedback: {type: string}
 
-reward_range: [0.0, 1.0]
+reward_range: [0.05, 0.95]
 max_steps_per_episode: 8

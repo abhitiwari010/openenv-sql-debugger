@@ -1,260 +1,164 @@
-"""
-SQL Data Analyst OpenEnv — baseline inference (hackathon format).
-
-Environment variables (set before running):
-  HF_TOKEN         Primary API key (Hugging Face / OpenAI-compatible).
-  API_BASE_URL     LLM base URL (e.g. https://api.openai.com/v1 or HF router).
-  MODEL_NAME       Model id for chat completions.
-  OPENAI_API_KEY   Optional fallback if HF_TOKEN is unset.
-  API_KEY          Optional second fallback.
-
-Optional:
-  SQL_AGENT_TASK      Logged as task= in [START] (default: sql_analyst_episode).
-  SQL_AGENT_BENCHMARK Logged as env= in [START] (default: sql_agent_openenv).
-  MAX_STEPS           Max env.step calls (default: 24).
-  OPENAI_SEED         Passed to OpenAI only when base URL looks like OpenAI.
-  ENV_CONTAINER_START true to use SqlEnvClient.from_docker_image (default: false).
-  IMAGE_NAME / LOCAL_IMAGE_NAME / ENV_IMAGE_NAME  Docker image tag when using container.
-"""
-
-from __future__ import annotations
-
 import os
 import re
-import sys
-import textwrap
-from typing import Any, Dict, List, Optional
-
-from dotenv import load_dotenv
+import json
+import requests
 from openai import OpenAI
 
-load_dotenv()
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+ENV_URL = os.getenv("ENV_URL", "http://localhost:8000") # defaults to common uvicorn port but user specified 7860
+MAX_STEPS = 6
+TEMPERATURE = 0.1
+MAX_TOKENS = 500
 
-from client import SqlEnvClient
-from models import SqlAction
+client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-# --- Mandatory hackathon configuration ---
-API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
-API_KEY = (
-    os.getenv("HF_TOKEN")
-    or os.getenv("OPENAI_API_KEY")
-    or os.getenv("API_KEY")
-)
+SYSTEM_PROMPT = """You are an expert SQL developer.
+For write_query tasks: write a correct SQL SELECT query.
+For fix_query tasks: fix the broken SQL provided.
+For optimize_query tasks: rewrite slow SQL using CTEs or JOINs instead of subqueries.
 
-TASK_NAME = os.getenv("SQL_AGENT_TASK", "sql_analyst_episode")
-BENCHMARK = os.getenv("SQL_AGENT_BENCHMARK", "sql_agent_openenv")
+ALWAYS respond with ONLY a JSON object like this:
+{"action_type": "write_query", "sql": "SELECT ...", "explanation": "reason"}
 
-MAX_STEPS = int(os.getenv("MAX_STEPS", "24"))
-OPENAI_SEED = int(os.getenv("OPENAI_SEED", "42"))
+Rules: Only SELECT allowed. No DROP DELETE INSERT UPDATE CREATE ALTER."""
 
-ENV_CONTAINER_START = os.getenv("ENV_CONTAINER_START", "false").lower() == "true"
-ENV_IMAGE_NAME = (
-    os.getenv("LOCAL_IMAGE_NAME")
-    or os.getenv("IMAGE_NAME")
-    or os.getenv("ENV_IMAGE_NAME", "sql-agent-env:latest")
-)
-
-# Grader task ids (must match core/tasks.py) for normalized [END] score in [0, 1]
-TASK_IDS = [
-    "employee_payroll_overview",
-    "department_budget_summary",
-    "senior_engineering_comp_review",
-]
-
-SYSTEM_PROMPT = textwrap.dedent(
-    """
-    You are an expert Data Analyst and SQL Agent.
-    You will be provided with a SQL Schema and an instruction.
-    Reply with exactly one SQL query string to execute.
-    Do NOT use markdown fences or explanations — only the raw SQL text.
-    """
-).strip()
-
-
-def log_start(task: str, env: str, model: str) -> None:
-    print(f"[START] task={task} env={env} model={model}")
-
-def log_step(
-    step: int,
-    action: str,
-    reward: float,
-    done: bool,
-    error: Optional[str],
-) -> None:
-    err_one = sanitize_one_line(error) if error else "null"
-    act_one = sanitize_one_line(action)
-    done_val = "true" if done else "false"
-    print(f"[STEP]  step={step} action={act_one} reward={reward:.2f} done={done_val} error={err_one}")
-
-def log_end(success: bool, steps: int, score: float) -> None:
-    succ_val = "true" if success else "false"
-    print(f"[END]   success={succ_val} steps={steps} rewards={score:.2f}")
-
-
-def sanitize_one_line(s: str) -> str:
-    if not s:
-        return ""
-    return " ".join(s.split())
-
-
-def build_user_prompt(step: int, observation: Any, history: List[str]) -> str:
-    schema = observation.schema_info
-    instruction = observation.current_task_instruction
-    exec_result = observation.execution_result or "None"
-    error = observation.execution_error or "None"
-    history_block = "\n".join(history[-6:]) if history else "None"
-    return textwrap.dedent(
-        f"""
-        Step: {step}
-        Database Schema:
-        {schema}
-
-        Task Instruction:
-        {instruction}
-
-        Previous Execution Result: {exec_result}
-        Previous Error: {error}
-
-        Recent history:
-        {history_block}
-
-        Write the precise SQL query string to accomplish the task instruction. Return nothing else.
-        """
-    ).strip()
-
-
-def parse_model_action(response_text: str) -> str:
-    query = (response_text or "").strip()
-    if query.startswith("```sql"):
-        query = query[6:]
-    if query.startswith("```"):
-        query = query[3:]
-    if query.endswith("```"):
-        query = query[:-3]
-    return query.strip()
-
-
-def _make_direct_client():
-    from server.environment import SqlEnvironment
-
-    base_env = SqlEnvironment()
-
-    class DirectClient:
-        def __init__(self, target):
-            self.target = target
-
-        def reset(self):
-            obs = self.target.reset()
-            return type(
-                "StepResult",
-                (),
-                {"observation": obs, "reward": 0.0, "done": False},
-            )()
-
-        def step(self, action):
-            obs = self.target.step(action)
-            return type(
-                "StepResult",
-                (),
-                {
-                    "observation": obs,
-                    "reward": obs.reward if obs.reward is not None else 0.0,
-                    "done": obs.done,
-                },
-            )()
-
-        def close(self):
-            pass
-
-    return DirectClient(base_env)
-
-
-def main() -> None:
-    if not API_KEY:
-        sys.exit(1)
-
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-
-    if ENV_CONTAINER_START:
-        env = SqlEnvClient.from_docker_image(ENV_IMAGE_NAME).sync()
-    else:
-        env = _make_direct_client()
-
-    history: List[str] = []
+def build_prompt(obs: dict) -> str:
+    obs_data = obs.get("observation", obs)
+    task_desc = obs_data.get("task_description", "")
+    schema_info = obs_data.get("schema_info", "")
+    sample_data = obs_data.get("sample_data", "")
+    hints = obs_data.get("metadata", [])
+    last_sql = obs_data.get("last_sql", "")
+    last_result = obs_data.get("last_result", "")
+    last_error = obs_data.get("last_error", "")
+    step_count = obs_data.get("step_count", 0)
+    feedback = obs_data.get("feedback", "")
     
-    try:
-        result = env.reset()
-        observation = result.observation
+    prompt = f"Task Description:\n{task_desc}\n\nSchema Info:\n{schema_info}\n\nSample Data:\n{sample_data}\n"
+    if hints:
+        prompt += f"\nHints: {', '.join(hints)}\n"
+    if last_sql:
+        prompt += f"\nLast SQL Submitted: {last_sql}\n"
+    if last_result:
+        prompt += f"Result of Last SQL: {last_result}\n"
+    if last_error:
+        prompt += f"Error Message: {last_error}\n"
+    if step_count > 0 and feedback:
+        prompt += f"Feedback from Grader: {feedback}\n"
         
-        current_task_id = observation.task_id
-        task_step = 1
-        log_start(task=current_task_id, env=BENCHMARK, model=MODEL_NAME)
+    prompt += "\nRespond with JSON action only."
+    return prompt
 
-        for step in range(1, MAX_STEPS + 1):
-            if result.done:
-                break
-
-            user_prompt = build_user_prompt(step, observation, history)
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ]
-
-            create_kwargs: Dict[str, Any] = {
-                "model": MODEL_NAME,
-                "messages": messages,
-                "temperature": 0.0,
-                "stream": False,
-            }
-            if re.search(r"openai\.com", API_BASE_URL, re.I):
-                create_kwargs["seed"] = OPENAI_SEED
-
+def parse_action(response_text: str, task_type: str) -> dict:
+    try:
+        return json.loads(response_text)
+    except json.JSONDecodeError:
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if json_match:
             try:
-                completion = client.chat.completions.create(**create_kwargs)
-                response_text = completion.choices[0].message.content or "SELECT 1"
-            except Exception:
-                response_text = "SELECT 1"
+                return json.loads(json_match.group(0))
+            except json.JSONDecodeError:
+                pass
+        
+        sql_match = re.search(r'(?i)SELECT\s+.*', response_text, re.DOTALL)
+        sql = sql_match.group(0).strip() if sql_match else "SELECT 1"
+        if sql.endswith('```'): sql = sql[:-3].strip()
+        
+        return {"action_type": task_type, "sql": sql, "explanation": "Fallback parsed"}
 
-            action_str = parse_model_action(response_text)
-            result = env.step(SqlAction(query=action_str))
-            observation = result.observation
+def run_episode(task_id: str) -> dict:
+    res = requests.post(f"{ENV_URL}/reset", json={"task_id": task_id})
+    if res.status_code != 200:
+        return {"task_id": task_id, "best_reward": 0.05}
+    obs_obj = res.json()
+    
+    best_reward = 0.05
+    for step in range(MAX_STEPS):
+        obs = obs_obj.get("observation", obs_obj)
+        if obs.get("done", False):
+            break
             
-            # reward is obtained from observation task_score or directly from step
-            task_score = float(observation.task_score if hasattr(observation, 'task_score') and observation.task_score is not None else 0.0)
-            if hasattr(observation, 'reward') and observation.reward is not None:
-                task_score = float(observation.reward)
-                
-            err_raw = observation.execution_error
-            next_task_id = getattr(observation, "task_id", None)
+        prompt = build_prompt(obs_obj)
+        
+        try:
+            completion = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=TEMPERATURE,
+                max_tokens=MAX_TOKENS
+            )
+            response_text = completion.choices[0].message.content or "{}"
+        except Exception:
+            response_text = "{}"
             
-            # task transitions or episode done signals end of current task
-            task_done = (next_task_id != current_task_id) or result.done
+        action = parse_action(response_text, obs.get("task_type", "write_query"))
+        
+        res = requests.post(f"{ENV_URL}/step", json=action)
+        if res.status_code != 200:
+            break
+        obs_obj = res.json()
+        reward = obs_obj.get("reward", 0.05)
+        
+        best_reward = max(best_reward, reward)
+        print(f"Step {step+1}: SQL={action.get('sql', '')[:60]}... Reward={reward:.3f} Feedback={obs_obj.get('observation', {}).get('feedback', '')}")
+        
+        if obs_obj.get("done", obs_obj.get("observation", {}).get("done", False)):
+            break
             
-            log_step(step=task_step, action=action_str, reward=task_score, done=task_done, error=err_raw)
+    return {"task_id": task_id, "best_reward": round(best_reward, 3)}
 
-            history.append(f"Q: {action_str[:200]} -> R: {task_score:+.2f}")
-
-            if task_done:
-                success = (task_score >= 0.95)
-                log_end(success=success, steps=task_step, score=task_score)
-                if result.done or not next_task_id:
-                    break
-                current_task_id = next_task_id
-                task_step = 1
-                log_start(task=current_task_id, env=BENCHMARK, model=MODEL_NAME)
-                history.clear()
-            else:
-                task_step += 1
-
+def main():
+    print(f"--- SQL Agent Inference ---")
+    print(f"Model: {MODEL_NAME}")
+    print(f"Env URL: {ENV_URL}")
+    
+    health = {"status": "unreachable"}
+    try:
+        health = requests.get(f"{ENV_URL}/health").json()
     except Exception:
         pass
-    finally:
+    print(f"Health: {health}")
+    
+    task_ids = ["easy_01", "easy_02", "medium_01", "medium_02", "hard_01", "hard_02"]
+    results = []
+    
+    for tid in task_ids:
+        print(f"\n=== Task: {tid} ===")
         try:
-            env.close()
-        except Exception:
-            pass
-
+            res = run_episode(tid)
+        except Exception as e:
+            res = {"task_id": tid, "best_reward": 0.05}
+            print(f"Error running task {tid}: {e}")
+        results.append(res)
+        
+    print("\n=== FINAL SCORES ===")
+    easy_scores = []
+    medium_scores = []
+    hard_scores = []
+    
+    for r in results:
+        t = r["task_id"]
+        v = r["best_reward"]
+        print(f"{t}: {v}")
+        if t.startswith("easy"): easy_scores.append(v)
+        elif t.startswith("medium"): medium_scores.append(v)
+        elif t.startswith("hard"): hard_scores.append(v)
+        
+    easy_avg = sum(easy_scores)/len(easy_scores) if easy_scores else 0.0
+    medium_avg = sum(medium_scores)/len(medium_scores) if medium_scores else 0.0
+    hard_avg = sum(hard_scores)/len(hard_scores) if hard_scores else 0.0
+    overall = (easy_avg + medium_avg + hard_avg) / 3.0
+    
+    print("\n--- AVERAGES ---")
+    print(f"Easy Average:   {easy_avg:.3f}")
+    print(f"Medium Average: {medium_avg:.3f}")
+    print(f"Hard Average:   {hard_avg:.3f}")
+    print(f"Overall Score:  {overall:.3f}")
 
 if __name__ == "__main__":
     main()
