@@ -1,145 +1,260 @@
-import uuid
+import sqlite3
+import re
+from typing import Dict, Any, List, Optional
+import json
 
-from openenv.core.env_server import Environment
-from models import SqlAction, SqlObservation, SqlState, SqlReward
-from database import SqliteManager
-from core import EnvironmentTasks, DataFrameGrader
+SCHEMA_SQL = """
+CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, department TEXT, salary INTEGER, hire_date TEXT, manager_id INTEGER);
+CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT, budget INTEGER, location TEXT);
+CREATE TABLE projects (id INTEGER PRIMARY KEY, name TEXT, department_id INTEGER, start_date TEXT, status TEXT);
+CREATE TABLE project_assignments (employee_id INTEGER, project_id INTEGER, hours_worked INTEGER);
+"""
 
-class SqlEnvironment(Environment):
-    """Orchestrates the SQL Agent execution matching the OpenEnv Gym API."""
+SEED_DATA_SQL = """
+INSERT INTO employees VALUES (1, 'Alice', 'Engineering', 95000, '2020-01-15', 3);
+INSERT INTO employees VALUES (2, 'Bob', 'Engineering', 85000, '2021-02-20', 3);
+INSERT INTO employees VALUES (3, 'Charlie', 'Engineering', 120000, '2019-01-10', NULL);
+INSERT INTO employees VALUES (4, 'David', 'Sales', 70000, '2022-03-05', 5);
+INSERT INTO employees VALUES (5, 'Eve', 'Sales', 92000, '2018-11-20', NULL);
+INSERT INTO employees VALUES (6, 'Frank', 'HR', 65000, '2023-05-12', NULL);
+
+INSERT INTO departments VALUES (1, 'Engineering', 500000, 'Building A');
+INSERT INTO departments VALUES (2, 'Sales', 300000, 'Building B');
+INSERT INTO departments VALUES (3, 'HR', 150000, 'Building C');
+
+INSERT INTO projects VALUES (1, 'Project Alpha', 1, '2023-01-01', 'Active');
+INSERT INTO projects VALUES (2, 'Project Beta', 2, '2023-06-15', 'Completed');
+
+INSERT INTO project_assignments VALUES (1, 1, 100);
+INSERT INTO project_assignments VALUES (2, 1, 150);
+INSERT INTO project_assignments VALUES (4, 2, 80);
+"""
+
+TASKS = [
+    {
+        "id": "easy_01",
+        "name": "Filter high earners",
+        "difficulty": "easy",
+        "type": "write_query",
+        "grader": True,
+        "description": "Find Engineering employees with salary > 90000, return name and salary ordered by salary DESC.",
+        "expected_rows": 2
+    },
+    {
+        "id": "easy_02",
+        "name": "Count per department",
+        "difficulty": "easy",
+        "type": "write_query",
+        "grader": True,
+        "description": "Count employees per department, return department and count ordered by count DESC.",
+        "expected_rows": 3
+    },
+    {
+        "id": "medium_01",
+        "name": "Fix broken JOIN",
+        "difficulty": "medium",
+        "type": "fix_query",
+        "grader": True,
+        "description": "Fix a broken JOIN query (missing ON keyword, wrong table alias in WHERE). Return name and department name.",
+        "expected_rows": 6
+    },
+    {
+        "id": "medium_02",
+        "name": "Fix GROUP BY",
+        "difficulty": "medium",
+        "type": "fix_query",
+        "grader": True,
+        "description": "Fix wrong GROUP BY (should GROUP BY department not id) finding max salary per department.",
+        "expected_rows": 3
+    },
+    {
+        "id": "hard_01",
+        "name": "Optimize correlated subquery",
+        "difficulty": "hard",
+        "type": "optimize_query",
+        "grader": True,
+        "description": "Replace correlated subquery with window function/CTE to find top earner per department with total hours.",
+        "expected_rows": 3
+    },
+    {
+        "id": "hard_02",
+        "name": "Eliminate N+1 subqueries",
+        "difficulty": "hard",
+        "type": "optimize_query",
+        "grader": True,
+        "description": "Eliminate N+1 subqueries using LEFT JOIN + GROUP BY to compute total hours per project.",
+        "expected_rows": 2
+    }
+]
+
+def build_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(':memory:')
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA_SQL)
+    conn.executescript(SEED_DATA_SQL)
+    conn.commit()
+    return conn
+
+class SqlEnvironment:
     def __init__(self):
-        super().__init__()
-        self._state = SqlState()
-        self.task_registry = EnvironmentTasks()
-        
-        # Instantiate db connection immediately for the server loop
-        self.db = SqliteManager()
-        self.db.connect()
-        self._dangerous_keywords = ("drop ", "delete ", "truncate ", "alter ", "update ", "insert ")
+        self.db = build_db()
+        self.max_steps = 8
+        self.step_count = 0
+        self.current_task = TASKS[0]
+        self.done = False
+        self.last_sql = ""
+        self.last_result = ""
+        self.last_error = ""
+        self.reward = 0.05
+        self.feedback = ""
 
-    def reset(self) -> SqlObservation:
-        self._state = SqlState(
-            episode_id=str(uuid.uuid4()),
-            current_task_index=0,
-            total_tasks=self.task_registry.get_total_tasks(),
-            accumulated_reward=0.0,
-            task_scores=[],
-            attempts_per_task=[0 for _ in range(self.task_registry.get_total_tasks())],
-        )
-        first_task = self.task_registry.get_task(0)
-        return SqlObservation(
-            current_task_instruction=first_task.instruction,
-            schema_info=self.db.get_schema_summary(),
-            task_id=first_task.task_id,
-            difficulty=first_task.difficulty_label,
-        )
+    def _clamp(self, score: float) -> float:
+        return round(max(0.05, min(0.95, score)), 4)
+
+    def _execute_sql(self, sql: str) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+        upper_sql = sql.upper()
+        blocked = ["DROP", "DELETE", "INSERT", "UPDATE", "CREATE", "ALTER", "TRUNCATE"]
+        for b in blocked:
+            if re.search(rf"\b{b}\b", upper_sql):
+                return None, f"Blocked keyword {b} found. Only SELECT allowed."
+        try:
+            cursor = self.db.cursor()
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows], None
+        except Exception as e:
+            return None, str(e)
+
+    def _grade_write(self, sql: str, rows: Optional[List[Dict]], expected_rows: int) -> float:
+        score = 0.0
+        upper_sql = sql.upper()
+        if "EMPLOYEES" in upper_sql or "DEPARTMENTS" in upper_sql:
+            score += 0.15
+        if "WHERE" in upper_sql:
+            score += 0.10
+        if "ORDER BY" in upper_sql:
+            score += 0.15
+        if rows is not None:
+            if len(rows) > 0:
+                score += 0.25
+            if len(rows) == expected_rows:
+                score += 0.25
+            elif abs(len(rows) - expected_rows) == 1:
+                score += 0.12
+        return self._clamp(score)
+
+    def _grade_fix(self, sql: str, rows: Optional[List[Dict]], expected_rows: int) -> float:
+        score = 0.0
+        upper_sql = sql.upper()
+        if rows is not None:
+            score += 0.35
+            if len(rows) == expected_rows:
+                score += 0.35
+        if re.search(r"\bJOIN\b.*\bON\b", upper_sql):
+            score += 0.15
+        if "WHERE" in upper_sql or "GROUP BY" in upper_sql:
+            score += 0.10
+        return self._clamp(score)
+
+    def _grade_optimize(self, sql: str, rows: Optional[List[Dict]], expected_rows: int) -> float:
+        score = 0.0
+        upper_sql = sql.upper()
+        if re.search(r"\b(WITH|ROW_NUMBER|RANK)\b", upper_sql):
+            score += 0.30
+        if "JOIN" in upper_sql:
+            score += 0.25
+        if upper_sql.count("SELECT") == 1:
+            score += 0.20
+        if rows is not None and len(rows) == expected_rows:
+            score += 0.20
+        return self._clamp(score)
+
+    def reset(self, task_id: Optional[str] = None, difficulty: Optional[str] = None) -> Dict[str, Any]:
+        self.step_count = 0
+        self.done = False
+        self.last_sql = ""
+        self.last_result = ""
+        self.last_error = ""
+        self.reward = self._clamp(0.0)
+        self.feedback = "Environment reset."
+        
+        if task_id:
+            for t in TASKS:
+                if t["id"] == task_id:
+                    self.current_task = t
+                    break
+        elif difficulty:
+            for t in TASKS:
+                if t["difficulty"] == difficulty:
+                    self.current_task = t
+                    break
+        else:
+            self.current_task = TASKS[0]
+            
+        return self.get_observation()
+
+    def get_observation(self) -> Dict[str, Any]:
+        return {
+            "task_id": self.current_task["id"],
+            "task_type": self.current_task["type"],
+            "task_description": self.current_task["description"],
+            "schema_info": SCHEMA_SQL.strip(),
+            "last_sql": self.last_sql,
+            "last_result": self.last_result,
+            "last_error": self.last_error,
+            "step_count": self.step_count,
+            "done": self.done,
+            "reward": self.reward,
+            "feedback": self.feedback
+        }
 
     @property
-    def state(self) -> SqlState:
-        return self._state
-
-    def step(self, action: SqlAction) -> SqlObservation:
-        self._state.step_count += 1
-        query = action.query.strip()
-        current_idx = self._state.current_task_index
-        n_tasks = self.task_registry.get_total_tasks()
-        while len(self._state.attempts_per_task) < n_tasks:
-            self._state.attempts_per_task.append(0)
-        task = self.task_registry.get_task(current_idx)
-        self._state.attempts_per_task[current_idx] += 1
-        
-        execution_result_str = None
-        error_str = None
-        score = 0.0001
-        grader_feedback = ""
-        reward = SqlReward(total=0.0, task_score=0.0001)
-        done = False
-
-        query_lower = query.lower()
-        if any(keyword in query_lower for keyword in self._dangerous_keywords):
-            reward.safety_penalty = -1.0
-            reward.total += reward.safety_penalty
-            error_str = "Destructive SQL command detected. Only read-only SELECT queries are allowed."
-        else:
-            reward.step_penalty = -0.02
-            reward.total += reward.step_penalty
-        
-        try:
-            if error_str:
-                raise ValueError(error_str)
-
-            # 1. Gather expected vs agent dataframes
-            expected_df = self.db.execute_dataframe(task.expected_query)
-            agent_df = self.db.execute_dataframe(query)
-            
-            # Serialize for observation
-            execution_result_str = agent_df.to_json(orient="records")
-            
-            # 2. Grade execution
-            grade_result = DataFrameGrader.grade_with_details(agent_df, expected_df)
-            score = grade_result["score"]
-            grader_feedback = grade_result["feedback"]
-            reward.details = grade_result["details"]
-            
-            # 3. Reward shaping
-            reward.task_score = score
-            reward.valid_sql_bonus = 0.1
-            reward.progress_bonus = 0.9 * score
-            reward.total += reward.valid_sql_bonus + reward.progress_bonus
-            
-            # 4. Check level progression
-            if score >= 0.95:
-                self._state.task_scores.append(score)
-                self._state.current_task_index += 1
-                if self._state.current_task_index >= self.task_registry.get_total_tasks():
-                    done = True
-            elif self._state.attempts_per_task[current_idx] >= self._state.max_attempts_per_task:
-                # Episode ends if agent gets stuck on same task
-                self._state.task_scores.append(score)
-                done = True
-                     
-        except Exception as e:
-            error_str = str(e)
-            reward.error_penalty = -0.5
-            reward.total += reward.error_penalty
-        
-        # Global accumulation
-        self._state.last_reward = reward.total
-        reward_breakdown = reward.model_dump() if hasattr(reward, "model_dump") else reward.dict()
-        self._state.last_info = {
-            "task_id": task.task_id,
-            "difficulty": task.difficulty_label,
-            "task_score": score,
-            "attempts_for_task": self._state.attempts_per_task[current_idx],
-            "reward_breakdown": reward_breakdown,
+    def state(self) -> Dict[str, Any]:
+        return {
+            "task": self.current_task["id"],
+            "step": self.step_count,
+            "done": self.done,
+            "reward": self.reward
         }
-        self._state.accumulated_reward += reward.total
-        
-        # Prepare observation response
-        if done:
-            total_score = sum(self._state.task_scores)
-            next_instruction = f"All tasks completed! Final SQL Capability Score: {total_score}"
-            schema = ""
-            task_id = task.task_id
-            difficulty = task.difficulty_label
-        else:
-            next_task = self.task_registry.get_task(self._state.current_task_index)
-            next_instruction = next_task.instruction
-            schema = self.db.get_schema_summary()
-            task_id = next_task.task_id
-            difficulty = next_task.difficulty_label
-            
-        obs = SqlObservation(
-            current_task_instruction=next_instruction,
-            schema_info=schema,
-            task_id=task_id,
-            difficulty=difficulty,
-            execution_result=execution_result_str,
-            execution_error=error_str,
-            task_score=score,
-            grader_feedback=grader_feedback,
-            reward=reward.total,
-            done=done,
-        )
 
-        return obs
+    def step(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        if self.done:
+            return self.get_observation()
+            
+        self.step_count += 1
+        sql = action.get("sql", "").strip()
+        self.last_sql = sql
+        
+        if not sql:
+            self.last_error = "No SQL provided."
+            self.last_result = ""
+            self.reward = self._clamp(0.0)
+            self.feedback = "Empty query."
+        else:
+            rows, err = self._execute_sql(sql)
+            if err:
+                self.last_error = err
+                self.last_result = ""
+                self.reward = self._clamp(0.0)
+                self.feedback = "Execution failed."
+            else:
+                self.last_error = ""
+                self.last_result = json.dumps(rows)
+                expected = self.current_task["expected_rows"]
+                ttype = self.current_task["type"]
+                
+                raw_score = 0.0
+                if ttype == "write_query":
+                    raw_score = self._grade_write(sql, rows, expected)
+                elif ttype == "fix_query":
+                    raw_score = self._grade_fix(sql, rows, expected)
+                elif ttype == "optimize_query":
+                    raw_score = self._grade_optimize(sql, rows, expected)
+                
+                self.reward = raw_score # already clamped internally by the functions
+                self.feedback = "Query executed successfully."
+
+        if self.step_count >= self.max_steps:
+            self.done = True
+            
+        return self.get_observation()
