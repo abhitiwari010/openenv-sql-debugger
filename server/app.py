@@ -1,5 +1,5 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from typing import Optional
 import json
@@ -32,7 +32,13 @@ class GradeRequest(BaseModel):
 # ── HTTP endpoints ────────────────────────────────────────────────────────────
 
 @app.get("/")
-def root():
+def root(request: Request):
+    # Smart routing: If a human browser loads the root URL, direct them to the UI!
+    # If the Hackathon Validator automated bot calls the root URL, serve the required JSON.
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept:
+        return RedirectResponse(url="/web")
+        
     return {
         "info": "SQL Agent Environment API",
         "version": "1.0.0",
