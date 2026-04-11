@@ -3,11 +3,13 @@ import re
 import json
 import requests
 from openai import OpenAI
+import sys
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 ENV_URL = os.getenv("ENV_URL", "http://localhost:7860")
+ENV_NAME = "sql_debugger"
 MAX_STEPS = 6
 TEMPERATURE = 0.1
 MAX_TOKENS = 500
@@ -93,25 +95,26 @@ def parse_action(response_text: str, task_type: str) -> dict:
         
     return {"action_type": task_type, "sql": "SELECT 1", "explanation": "parse failed"}
 
-def run_episode(task_id: str) -> dict:
+def run_episode(task_id: str):
     try:
         res = requests.post(f"{ENV_URL}/reset", json={"task_id": task_id, "difficulty": None})
         res.raise_for_status()
         obs_obj = res.json()
         obs = obs_obj["observation"]
     except Exception as e:
-        print(f"  Error resetting environment: {e}")
-        return {"task_id": task_id, "best_reward": 0.05}
+        # Failsafe reset
+        obs = {"task_type": "write_query"}
         
-    print(f"  Task: {task_id} | {obs.get('task_type', '')}")
-    print(f"  Desc: {obs.get('task_description', '')[:100]}...")
+    print(f"[START] task={task_id} env={ENV_NAME} model={MODEL_NAME}", flush=True)
     
     best_reward = 0.0
     history = []
     
+    step = 0
+    done = False
+    
     for step in range(1, MAX_STEPS + 1):
         if obs.get("done", False):
-            print(f"  Done at step {step}")
             break
             
         prompt = build_prompt(obs, step, history)
@@ -128,79 +131,52 @@ def run_episode(task_id: str) -> dict:
             )
             response_text = completion.choices[0].message.content or ""
         except Exception as e:
-            print(f"  API Error: {e}")
             response_text = ""
             
         action = parse_action(response_text, obs.get("task_type", "write_query"))
         
-        print(f"    Step {step}: {action.get('sql', '')[:70]}...")
+        # Safe JSON stringification for the action output in the log
+        action_str = json.dumps(action)
         
         try:
             step_res = requests.post(f"{ENV_URL}/step", json=action)
             step_res.raise_for_status()
             step_data = step_res.json()
         except Exception as e:
-            print(f"  Env Step Error: {e}")
-            break
+            # Fallback if step errors
+            step_data = {"reward": 0.05, "observation": {"done": True}, "done": True, "error": str(e)}
             
         reward = step_data.get("reward", 0.05)
+        done = step_data.get("done", False)
+        err = step_data.get("error")
+        # Format the numbers cleanly
+        reward_formatted = f"{reward:.2f}"
+        
         best_reward = max(best_reward, reward)
         obs = step_data.get("observation", {})
         
-        history.append(f"Step {step}: reward={reward:.3f} | {obs.get('feedback', '')[:60]}")
-        print(f"    Reward: {reward:.3f} | Done: {obs.get('done', False)} | {obs.get('feedback', '')[:60]}")
+        # Convert flags to lowercase 'true' or 'false' for validator tracking
+        done_str = "true" if done else "false"
+        err_str = "null" if not err else f'"{str(err)}"'
         
-        if obs.get("done", False):
+        print(f"[STEP] step={step} action={action_str} reward={reward_formatted} done={done_str} error={err_str}", flush=True)
+        
+        history.append(f"Step {step}: reward={reward_formatted}")
+        
+        if done:
             break
             
-    return {"task_id": task_id, "best_reward": round(best_reward, 3)}
+    # Track final outcome: successes usually represent the max reward crossing some threshold 
+    success_str = "true" if best_reward > 0.8 else "false"
+    best_reward_formatted = f"{best_reward:.2f}"
+    
+    print(f"[END] success={success_str} steps={step} rewards={best_reward_formatted}", flush=True)
 
 def main():
-    print("=" * 65)
-    print("SQL Debugger OpenEnv — Baseline Inference")
-    print(f"Model : {MODEL_NAME}")
-    print(f"Env   : {ENV_URL}")
-    print("=" * 65)
-    
-    try:
-        health_res = requests.get(f"{ENV_URL}/health")
-        print(f"Health: {health_res.json()}")
-    except Exception as e:
-        print(f"Health Check Failed: {e}")
-        
+    # Only process the tasks quietly!
     task_ids = ["easy_01", "easy_02", "medium_01", "medium_02", "hard_01", "hard_02"]
-    results = []
-    
-    for i, tid in enumerate(task_ids):
-        print(f"\\n[{i+1}/6] Running {tid}...")
-        try:
-            res = run_episode(tid)
-        except Exception as e:
-            print(f"  Error running {tid}: {e}")
-            res = {"task_id": tid, "best_reward": 0.05}
-        results.append(res)
-        
-    print("\n" + "=" * 65)
-    print("BASELINE SCORES")
-    print("=" * 65)
-    
-    for r in results:
-        print(f"  {r['task_id']:15s}: {r['best_reward']:.3f}")
-        
-    easy_scores = [r['best_reward'] for r in results if r['task_id'].startswith('easy')]
-    medium_scores = [r['best_reward'] for r in results if r['task_id'].startswith('medium')]
-    hard_scores = [r['best_reward'] for r in results if r['task_id'].startswith('hard')]
-    
-    easy_avg = sum(easy_scores)/len(easy_scores) if easy_scores else 0.0
-    medium_avg = sum(medium_scores)/len(medium_scores) if medium_scores else 0.0
-    hard_avg = sum(hard_scores)/len(hard_scores) if hard_scores else 0.0
-    overall = sum(r['best_reward'] for r in results) / len(results) if results else 0.0
-    
-    print(f"\\nEasy average    : {easy_avg:.3f}")
-    print(f"Medium average  : {medium_avg:.3f}")
-    print(f"Hard average    : {hard_avg:.3f}")
-    print(f"Overall average : {overall:.3f}")
-    print("=" * 65)
+    for tid in task_ids:
+        run_episode(tid)
 
 if __name__ == "__main__":
     main()
